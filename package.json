@@ -1,0 +1,17 @@
+{
+  "name": "utacho",
+  "version": "1.0.0",
+  "private": true,
+  "description": "カラオケの持ち歌管理PWA「歌帳」",
+  "scripts": {
+    "build": "esbuild src/main.jsx --bundle --minify --jsx=automatic --outfile=docs/app.js",
+    "icons": "python3 make_icons.py"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
