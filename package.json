@@ -5,6 +5,7 @@
   "description": "カラオケの持ち歌管理PWA「歌帳」",
   "scripts": {
     "build": "esbuild src/main.jsx --bundle --minify --jsx=automatic --outfile=docs/app.js",
+    "smoke": "esbuild scripts/smoke-entry.jsx --bundle --jsx=automatic --platform=node --format=cjs --outfile=.smoke/out.cjs && node .smoke/out.cjs",
     "icons": "python3 make_icons.py"
   },
   "dependencies": {

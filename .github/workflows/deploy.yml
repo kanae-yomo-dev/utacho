@@ -1,0 +1,58 @@
+# src を main に push すると、自動でビルド→スモークテスト→GitHub Pages公開までやる。
+# スモークテストが失敗したら公開されない（壊れた版が本番に出ない安全弁）。
+name: Build and deploy to Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # Actionsタブから手動実行もできる
+
+# Pagesへ公開するために必要な権限
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同時に複数の公開が走らないようにする（新しいpushを優先しすぎず、走行中は完走させる）
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v6
+
+      - name: Node.js を用意
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: 依存をインストール
+        run: npm ci
+
+      - name: ビルド（docs/app.js を生成）
+        run: npm run build
+
+      - name: スモークテスト（真っ暗画面チェック）
+        run: npm run smoke
+
+      - name: Pages の設定を読み込み（未設定ならActions配信を有効化）
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: 公開物(docs/)をアップロード
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: GitHub Pages へ公開
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,2 +1,8 @@
 node_modules/
 .DS_Store
+
+# ビルド生成物（CIが毎回ビルドするのでコミット不要）
+docs/app.js
+
+# スモークテストの一時出力
+.smoke/
