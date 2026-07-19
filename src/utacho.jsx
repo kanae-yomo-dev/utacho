@@ -1112,10 +1112,22 @@ export default function KaraokeApp() {
     setRecError(null);
     stopPlayback();
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // カラオケ録音では音声通話向けの処理(エコーキャンセル/ノイズ抑制/自動ゲイン)が
+      // 録音開始数秒後に効き始め、歌声や伴奏を削って「こもった音質」になる。生音で録るため明示的に無効化する。
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
       const mime =
         ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find((t) => window.MediaRecorder.isTypeSupported(t)) || "";
-      const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      // 録音品質を上げるため音声ビットレートを明示(ブラウザ既定より高音質側に固定)
+      const recorder = new MediaRecorder(stream, {
+        ...(mime ? { mimeType: mime } : {}),
+        audioBitsPerSecond: 256000,
+      });
       const chunks = [];
       const startedAt = Date.now();
       recorder.ondataavailable = (e) => {
