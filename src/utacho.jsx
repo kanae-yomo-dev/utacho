@@ -171,28 +171,56 @@ const storage =
       };
 
 const MACHINES = ["DAM", "JOYSOUND"]; // 採点機
-// 採点技法メトリクス(曲の自己ベストとテイクの両方で使う)。int=trueは整数入力のみ
-const TECH_METRICS = [
-  { key: "pitchAcc", label: "音程", unit: "%", int: false, dashLabel: "音程正確率" },
-  { key: "vibratoSec", label: "ビブラート", unit: "秒", int: false, dashLabel: "ビブラート最長" },
-  { key: "shakuri", label: "しゃくり", unit: "回", int: true, dashLabel: "しゃくり最多" },
-];
+// 採点機ごとの技法メトリクス(曲の自己ベストとテイクの両方で使う)。int=trueは整数入力のみ
+const MACHINE_TECHS = {
+  DAM: [
+    { key: "pitchAcc", label: "音程", unit: "%", int: false, dashLabel: "音程正確率" },
+    { key: "vibratoSec", label: "ビブラート", unit: "秒", int: false, dashLabel: "ビブラート最長" },
+    { key: "shakuri", label: "しゃくり", unit: "回", int: true, dashLabel: "しゃくり最多" },
+  ],
+  JOYSOUND: [
+    { key: "pitchAcc", label: "音程", unit: "%", int: false, dashLabel: "音程正確率" },
+    { key: "vibratoCount", label: "ビブラート", unit: "回", int: true, dashLabel: "ビブラート最多" },
+    { key: "shakuri", label: "しゃくり", unit: "回", int: true, dashLabel: "しゃくり最多" },
+  ],
+};
+
+const emptyBests = () => ({
+  DAM: { score: "", pitchAcc: "", vibratoSec: "", shakuri: "" },
+  JOYSOUND: { score: "", pitchAcc: "", vibratoCount: "", shakuri: "" },
+});
 
 const emptyForm = {
   title: "",
   artist: "",
   keyShift: 0,
   ohako: false,
-  score: "",
-  scoreMachine: "", // "" | "DAM" | "JOYSOUND"
-  pitchAcc: "", // 音程正確率(%)の自己ベスト
-  vibratoSec: "", // ビブラート秒数の自己ベスト
-  shakuri: "", // しゃくり回数の自己ベスト
+  bests: emptyBests(),
   rangeLo: null, // 原曲最低音(MIDIノート番号)
   rangeHi: null, // 原曲最高音(MIDIノート番号)
   tags: [],
   memo: "",
 };
+
+// 旧ローカルデータを機種別スロットへ移す。機種なしはJOYSOUND、秒のビブラートだけは常にDAM。
+function migrateSong(s) {
+  if (s.bests) return s;
+  const bests = emptyBests();
+  const machine = s.scoreMachine === "DAM" ? "DAM" : "JOYSOUND";
+  ["score", "pitchAcc", "shakuri"].forEach((key) => {
+    bests[machine][key] = s[key] ?? "";
+  });
+  bests.DAM.vibratoSec = s.vibratoSec ?? "";
+  const { score, scoreMachine, pitchAcc, vibratoSec, shakuri, ...rest } = s;
+  return { ...rest, bests };
+}
+
+const machineOfTake = (t) => (t.machine === "DAM" ? "DAM" : "JOYSOUND");
+const representativeScore = (s) => Math.max(...MACHINES.map((m) => Number(s.bests?.[m]?.score) || 0));
+const scoreSummary = (s) => MACHINES
+  .filter((m) => s.bests?.[m]?.score)
+  .map((m) => `${s.bests[m].score}点(${m === "JOYSOUND" ? "JOY" : m})`)
+  .join(" ");
 
 // 新規テイクの採点機デフォルト用(最後に選んだ採点機を記憶)
 const getLastMachine = () => {
@@ -287,8 +315,11 @@ function parseMarkdown(text) {
       errors.push(`${idx + 1}行目: 「- **曲名**」の形式で読み取れませんでした`);
       return;
     }
-    const song = { title: m[1].trim(), artist: "", keyShift: 0, ohako: false, score: "", scoreMachine: "", pitchAcc: "", vibratoSec: "", shakuri: "", rangeLo: null, rangeHi: null, tags: [], memo: "" };
+    const song = { title: m[1].trim(), artist: "", keyShift: 0, ohako: false, bests: emptyBests(), rangeLo: null, rangeHi: null, tags: [], memo: "" };
     const segs = m[2].split("｜");
+    let legacyMachine = "JOYSOUND";
+    let legacyPitch = "";
+    let legacyShakuri = "";
     const head = segs.shift().trim(); // " / アーティスト" または空
     if (head.startsWith("/")) song.artist = head.slice(1).trim();
     else if (head) song.artist = head;
@@ -296,17 +327,30 @@ function parseMarkdown(text) {
       const seg = segRaw.trim();
       if (!seg) continue; // 末尾「｜」などの空セグメントは許容
       let km;
-      if ((km = seg.match(/^キー([♯♭])(\d+)$/))) {
+      const prefixed = seg.match(/^(DAM|JOY|JOYSOUND):\s*(.*)$/);
+      if (prefixed) {
+        const machine = prefixed[1] === "DAM" ? "DAM" : "JOYSOUND";
+        prefixed[2].split("・").forEach((itemRaw) => {
+          const item = itemRaw.trim();
+          if ((km = item.match(/^([0-9.]+)点$/))) song.bests[machine].score = km[1];
+          else if ((km = item.match(/^音程([0-9.]+)%$/))) song.bests[machine].pitchAcc = km[1];
+          else if ((km = item.match(/^ビブ(?:ラート)?([0-9.]+)(秒|回)$/))) {
+            if (machine === "DAM" && km[2] === "秒") song.bests.DAM.vibratoSec = km[1];
+            if (machine === "JOYSOUND" && km[2] === "回") song.bests.JOYSOUND.vibratoCount = km[1];
+          } else if ((km = item.match(/^しゃくり([0-9]+)回$/))) song.bests[machine].shakuri = km[1];
+        });
+      } else if ((km = seg.match(/^キー([♯♭])(\d+)$/))) {
         song.keyShift = km[1] === "♯" ? Number(km[2]) : -Number(km[2]);
       } else if ((km = seg.match(/^([0-9.]+)点(?:\((DAM|JOYSOUND)\))?$/))) {
-        song.score = km[1];
-        song.scoreMachine = km[2] || "";
+        const machine = km[2] === "DAM" ? "DAM" : "JOYSOUND";
+        legacyMachine = machine;
+        song.bests[machine].score = km[1];
       } else if ((km = seg.match(/^音程([0-9.]+)%$/))) {
-        song.pitchAcc = km[1];
+        legacyPitch = km[1];
       } else if ((km = seg.match(/^ビブ(?:ラート)?([0-9.]+)秒$/))) {
-        song.vibratoSec = km[1];
+        song.bests.DAM.vibratoSec = km[1];
       } else if ((km = seg.match(/^しゃくり([0-9]+)回$/))) {
-        song.shakuri = km[1];
+        legacyShakuri = km[1];
       } else if ((km = seg.match(/^音域(\S+)〜(\S+)$/))) {
         const lo = karaokeToMidi(km[1]);
         const hi = karaokeToMidi(km[2]);
@@ -326,6 +370,8 @@ function parseMarkdown(text) {
         });
       }
     }
+    if (legacyPitch) song.bests[legacyMachine].pitchAcc = legacyPitch;
+    if (legacyShakuri) song.bests[legacyMachine].shakuri = legacyShakuri;
     seen.set(idOf(song), song);
   });
   seen.forEach((s) => songs.push(s));
@@ -437,11 +483,9 @@ const fmtRecSize = (b) => (b >= 1048576 ? `${(b / 1048576).toFixed(1)}MB` : `${M
 const isSameSong = (a, b) =>
   (a.keyShift || 0) === (b.keyShift || 0) &&
   !!a.ohako === !!b.ohako &&
-  String(a.score || "") === String(b.score || "") &&
-  (a.scoreMachine || "") === (b.scoreMachine || "") &&
-  String(a.pitchAcc || "") === String(b.pitchAcc || "") &&
-  String(a.vibratoSec || "") === String(b.vibratoSec || "") &&
-  String(a.shakuri || "") === String(b.shakuri || "") &&
+  MACHINES.every((m) => Object.keys(emptyBests()[m]).every((k) =>
+    String(a.bests?.[m]?.[k] || "") === String(b.bests?.[m]?.[k] || "")
+  )) &&
   (a.rangeLo ?? null) === (b.rangeLo ?? null) &&
   (a.rangeHi ?? null) === (b.rangeHi ?? null) &&
   (a.memo || "") === (b.memo || "") &&
@@ -497,6 +541,7 @@ export default function KaraokeApp() {
   const [sortBy, setSortBy] = useState("added");
   const [modal, setModal] = useState(null); // null | {mode:'add'} | {mode:'edit', id}
   const [form, setForm] = useState(emptyForm);
+  const [bestMachine, setBestMachine] = useState(() => getLastMachine() || "JOYSOUND");
   const [pick, setPick] = useState(null); // ランダム選曲結果
   const [rolling, setRolling] = useState(false);
   const [exportText, setExportText] = useState(null); // MDエクスポート
@@ -550,10 +595,16 @@ export default function KaraokeApp() {
       const parts = [`**${s.title}**` + (s.artist ? ` / ${s.artist}` : "")];
       if (s.keyShift) parts.push(`キー${keyLabel(s.keyShift)}`);
       if (s.rangeLo != null && s.rangeHi != null) parts.push(`音域${rangeLabel(s.rangeLo, s.rangeHi)}`);
-      if (s.score) parts.push(`${s.score}点${s.scoreMachine ? `(${s.scoreMachine})` : ""}`);
-      if (s.pitchAcc) parts.push(`音程${s.pitchAcc}%`);
-      if (s.vibratoSec) parts.push(`ビブラート${s.vibratoSec}秒`);
-      if (s.shakuri) parts.push(`しゃくり${s.shakuri}回`);
+      MACHINES.forEach((machine) => {
+        const best = s.bests?.[machine];
+        if (!best || !Object.values(best).some(Boolean)) return;
+        const values = [];
+        if (best.score) values.push(`${best.score}点`);
+        MACHINE_TECHS[machine].forEach((metric) => {
+          if (best[metric.key]) values.push(`${metric.label}${best[metric.key]}${metric.unit}`);
+        });
+        parts.push(`${machine === "JOYSOUND" ? "JOY" : machine}: ${values.join("・")}`);
+      });
       if (s.ohako) parts.push("★十八番");
       if (s.tags && s.tags.length) parts.push(s.tags.join("・"));
       if (s.memo) parts.push(`メモ: ${escapeMemo(s.memo)}`);
@@ -683,7 +734,7 @@ export default function KaraokeApp() {
       let list = [];
       try {
         const res = await storage.get(STORAGE_KEY);
-        if (res && res.value) list = JSON.parse(res.value);
+        if (res && res.value) list = JSON.parse(res.value).map(migrateSong);
       } catch (e) {
         // 初回はキーが無いので何もしない
       }
@@ -735,7 +786,7 @@ export default function KaraokeApp() {
       added: (a, b) => b.createdAt - a.createdAt,
       title: (a, b) => a.title.localeCompare(b.title, "ja"),
       artist: (a, b) => a.artist.localeCompare(b.artist, "ja"),
-      score: (a, b) => (Number(b.score) || 0) - (Number(a.score) || 0),
+      score: (a, b) => representativeScore(b) - representativeScore(a),
     };
     return [...list].sort(col[sortBy]);
   }, [songs, query, tagFilter, sortBy]);
@@ -888,14 +939,24 @@ export default function KaraokeApp() {
 
   // ---- ダッシュボード統計 ----
   const stats = useMemo(() => {
-    const scored = songs.filter((s) => Number(s.score) > 0);
+    const scored = songs.filter((s) => representativeScore(s) > 0);
     const byMachine = MACHINES.map((m) => {
-      const list = scored.filter((s) => s.scoreMachine === m);
+      const list = songs.filter((s) => Number(s.bests?.[m]?.score) > 0);
+      const techBest = MACHINE_TECHS[m].map((mt) => {
+        let best = null;
+        songs.forEach((s) => {
+          const value = s.bests?.[m]?.[mt.key];
+          const v = Number(value);
+          if (value && v > 0 && (!best || v > best.v)) best = { v, value, s };
+        });
+        return { ...mt, best };
+      }).filter((mt) => mt.best);
       return {
         machine: m,
         count: list.length,
-        avg: list.length ? list.reduce((a, s) => a + Number(s.score), 0) / list.length : null,
-        best: list.reduce((b, s) => (!b || Number(s.score) > Number(b.score) ? s : b), null),
+        avg: list.length ? list.reduce((a, s) => a + Number(s.bests[m].score), 0) / list.length : null,
+        best: list.reduce((b, s) => (!b || Number(s.bests[m].score) > Number(b.s.bests[m].score) ? { s } : b), null),
+        techBest,
       };
     });
     const binDefs = [
@@ -909,12 +970,12 @@ export default function KaraokeApp() {
     const bins = binDefs.map((b) => ({
       ...b,
       count: scored.filter((s) => {
-        const v = Number(s.score);
+        const v = representativeScore(s);
         return v >= b.min && v < b.max;
       }).length,
     }));
     const maxBin = Math.max(1, ...bins.map((b) => b.count));
-    const top = [...scored].sort((a, b) => Number(b.score) - Number(a.score)).slice(0, 5);
+    const top = [...scored].sort((a, b) => representativeScore(b) - representativeScore(a)).slice(0, 5);
     // 実効音域(キー変更込み)の最高・最低
     let hiSong = null;
     let loSong = null;
@@ -935,21 +996,12 @@ export default function KaraokeApp() {
     ).size;
     const recentTakes = [...recMeta].sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
     const titleByKey = new Map(songs.map((s) => [songKey(s), s.title]));
-    // 技法別自己ベスト(曲の値=手入力とテイクからの自動反映の両方を含む)
-    const techBest = TECH_METRICS.map((mt) => {
-      let best = null;
-      songs.forEach((s) => {
-        const v = Number(s[mt.key]);
-        if (s[mt.key] && v > 0 && (!best || v > best.v)) best = { v, s };
-      });
-      return { ...mt, best };
-    }).filter((mt) => mt.best);
     return {
       total: songs.length,
       scoredCount: scored.length,
       ohako: songs.filter((s) => s.ohako).length,
-      over90: scored.filter((s) => Number(s.score) >= 90).length,
-      byMachine, bins, maxBin, top, hiSong, loSong, techBest,
+      over90: scored.filter((s) => representativeScore(s) >= 90).length,
+      byMachine, bins, maxBin, top, hiSong, loSong,
       takesTotal: recMeta.length, takes30, days30, recentTakes, titleByKey,
     };
   }, [songs, recMeta]);
@@ -1051,7 +1103,8 @@ export default function KaraokeApp() {
   };
 
   const openAdd = () => {
-    setForm(emptyForm);
+    setForm({ ...emptyForm, bests: emptyBests() });
+    setBestMachine(getLastMachine() || "JOYSOUND");
     setConfirmDelete(false);
     resetArtistSearch();
     setNewTag(null);
@@ -1060,8 +1113,8 @@ export default function KaraokeApp() {
     setModal({ mode: "add" });
   };
   const openEdit = (s) => {
-    // emptyFormを先に敷いて、旧バージョンで保存された曲に無いフィールド(技法など)を空文字で補完
-    setForm({ ...emptyForm, ...s, score: s.score ?? "" });
+    setForm({ ...emptyForm, ...s, bests: s.bests || emptyBests() });
+    setBestMachine(getLastMachine() || "JOYSOUND");
     setConfirmDelete(false);
     setConfirmTake(null);
     setRecError(null);
@@ -1151,6 +1204,7 @@ export default function KaraokeApp() {
           machine: getLastMachine(),
           pitchAcc: "",
           vibratoSec: "",
+          vibratoCount: "",
           shakuri: "",
         };
         try {
@@ -1352,7 +1406,7 @@ export default function KaraokeApp() {
     setAssignQuery("");
   };
 
-  // テイクの点数・採点機を更新。点数が曲の最高スコアを超えたら自動で更新する
+  // テイクの点数・採点機を更新。値が同じ採点機枠の自己ベストを超えたら自動で更新する
   const updateTake = (t, patch) => {
     const next = { ...t, ...patch };
     setRecMeta((m) => m.map((x) => (x.id === t.id ? next : x)));
@@ -1360,17 +1414,16 @@ export default function KaraokeApp() {
     if (patch.machine) setLastMachine(patch.machine);
     if (!editingSong) return;
     // テイクの値が曲の自己ベストを超えたら自動で曲側を更新する(点数・技法とも)
-    const upd = {};
-    if (Number(next.score) > (Number(editingSong.score) || 0)) {
-      upd.score = next.score;
-      upd.scoreMachine = next.machine || "";
-    }
-    ["pitchAcc", "vibratoSec", "shakuri"].forEach((k) => {
-      if (Number(next[k]) > (Number(editingSong[k]) || 0)) upd[k] = next[k];
+    const machine = machineOfTake(next);
+    const current = editingSong.bests?.[machine] || emptyBests()[machine];
+    const promoted = { ...current };
+    ["score", ...MACHINE_TECHS[machine].map((metric) => metric.key)].forEach((k) => {
+      if (Number(next[k]) > (Number(current[k]) || 0)) promoted[k] = next[k];
     });
-    if (Object.keys(upd).length > 0) {
-      persist(songs.map((s) => (s.id === editingSong.id ? { ...s, ...upd } : s)));
-      setForm((f) => ({ ...f, ...upd }));
+    if (Object.keys(promoted).some((k) => promoted[k] !== current[k])) {
+      const bests = { ...editingSong.bests, [machine]: promoted };
+      persist(songs.map((s) => (s.id === editingSong.id ? { ...s, bests } : s)));
+      setForm((f) => ({ ...f, bests: { ...f.bests, [machine]: promoted } }));
     }
   };
 
@@ -1542,7 +1595,7 @@ export default function KaraokeApp() {
               </div>
               <div style={{ display: "flex", gap: 10, marginTop: 5, alignItems: "center", fontSize: 13, color: C.muted }}>
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.artist || "アーティスト未登録"}</span>
-                {s.score && (
+                {scoreSummary(s) && (
                   <span
                     style={{
                       color: C.cyan, flexShrink: 0, fontSize: 12,
@@ -1550,7 +1603,7 @@ export default function KaraokeApp() {
                       border: `1px solid ${C.cyan}`, background: C.cyanSoft,
                     }}
                   >
-                    {s.score}点{s.scoreMachine ? `(${s.scoreMachine})` : ""}
+                    {scoreSummary(s)}
                   </span>
                 )}
                 {(recCounts.get(songKey(s)) || 0) > 0 && (
@@ -1998,17 +2051,22 @@ export default function KaraokeApp() {
                 <div key={m.machine} style={{ background: C.bg, border: `1px solid ${C.line}`, borderRadius: 12, padding: 12 }}>
                   <div style={{ fontSize: 13, fontWeight: 700, color: C.cyan }}>{m.machine}</div>
                   {m.count === 0 ? (
-                    <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>記録なし</div>
+                    <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>スコア記録なし</div>
                   ) : (
                     <>
                       <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>
                         {m.count}曲 ・ 平均 <span style={{ color: C.text, fontWeight: 700 }}>{m.avg.toFixed(1)}</span>点
                       </div>
                       <div style={{ fontSize: 12, color: C.muted, marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        最高 <span style={{ color: C.amber, fontWeight: 700 }}>{m.best.score}</span>点「{m.best.title}」
+                        最高 <span style={{ color: C.amber, fontWeight: 700 }}>{m.best.s.bests[m.machine].score}</span>点「{m.best.s.title}」
                       </div>
                     </>
                   )}
+                  {m.techBest.map((mt) => (
+                    <div key={mt.key} style={{ fontSize: 11, color: C.muted, marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {mt.dashLabel} <span style={{ color: C.text, fontWeight: 700 }}>{mt.best.value}{mt.unit}</span>「{mt.best.s.title}」
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
@@ -2036,24 +2094,7 @@ export default function KaraokeApp() {
                     <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
                       <span style={{ width: 20, color: i === 0 ? C.amber : C.muted, fontWeight: 800, flexShrink: 0 }}>{i + 1}</span>
                       <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.text }}>{s.title}</span>
-                      <span style={{ color: C.magenta, fontWeight: 800, flexShrink: 0 }}>{s.score}点</span>
-                      {s.scoreMachine && <span style={{ fontSize: 11, color: C.muted, flexShrink: 0 }}>{s.scoreMachine}</span>}
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-
-            {/* 技法別自己ベスト */}
-            {stats.techBest.length > 0 && (
-              <>
-                <label style={{ fontSize: 12, color: C.muted }}>技法別自己ベスト</label>
-                <div style={{ margin: "8px 0 16px", background: C.bg, border: `1px solid ${C.line}`, borderRadius: 12, padding: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-                  {stats.techBest.map((mt) => (
-                    <div key={mt.key} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-                      <span style={{ width: 92, color: C.muted, flexShrink: 0, fontSize: 12 }}>{mt.dashLabel}</span>
-                      <span style={{ color: C.amber, fontWeight: 800, flexShrink: 0 }}>{mt.best.s[mt.key]}{mt.unit}</span>
-                      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.muted }}>「{mt.best.s.title}」</span>
+                      <span style={{ color: C.magenta, fontWeight: 800, flexShrink: 0 }}>{scoreSummary(s)}</span>
                     </div>
                   ))}
                 </div>
@@ -2680,20 +2721,14 @@ export default function KaraokeApp() {
             </div>
 
             <div style={{ marginBottom: 14 }}>
-              <label style={{ fontSize: 12, color: C.muted }}>最高スコア・採点機</label>
+              <label style={{ fontSize: 12, color: C.muted }}>自己ベスト</label>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
-                <input
-                  value={form.score}
-                  onChange={(e) => setForm({ ...form, score: e.target.value.replace(/[^0-9.]/g, "") })}
-                  placeholder="—" inputMode="decimal"
-                  style={{ width: 90, padding: "10px 12px", borderRadius: 12, border: `1px solid ${C.line}`, background: C.bg, color: C.text, fontSize: 15, height: 42 }}
-                />
                 {MACHINES.map((m) => {
-                  const on = form.scoreMachine === m;
+                  const on = bestMachine === m;
                   return (
                     <button
                       key={m}
-                      onClick={() => setForm((f) => ({ ...f, scoreMachine: on ? "" : m }))}
+                      onClick={() => { setBestMachine(m); setLastMachine(m); }}
                       style={{
                         padding: "10px 13px", borderRadius: 999, fontSize: 13, cursor: "pointer",
                         border: `1px solid ${on ? C.cyan : C.line}`,
@@ -2706,17 +2741,23 @@ export default function KaraokeApp() {
                   );
                 })}
               </div>
-            </div>
-
-            <div style={{ marginBottom: 14 }}>
-              <label style={{ fontSize: 12, color: C.muted }}>技法の自己ベスト(DAM精密採点など)</label>
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
-                {TECH_METRICS.map((f) => (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ fontSize: 12, color: C.muted }}>スコア</span>
+                  <input
+                    value={form.bests?.[bestMachine]?.score ?? ""}
+                    onChange={(e) => setForm((prev) => ({ ...prev, bests: { ...prev.bests, [bestMachine]: { ...prev.bests[bestMachine], score: e.target.value.replace(/[^0-9.]/g, "") } } }))}
+                    placeholder="—" inputMode="decimal"
+                    style={{ width: 70, padding: "10px", borderRadius: 12, border: `1px solid ${C.line}`, background: C.bg, color: C.text, fontSize: 15, height: 42, boxSizing: "border-box" }}
+                  />
+                  <span style={{ fontSize: 12, color: C.muted }}>点</span>
+                </span>
+                {MACHINE_TECHS[bestMachine].map((f) => (
                   <span key={f.key} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
                     <span style={{ fontSize: 12, color: C.muted }}>{f.label}</span>
                     <input
-                      value={form[f.key] ?? ""}
-                      onChange={(e) => setForm({ ...form, [f.key]: e.target.value.replace(f.int ? /[^0-9]/g : /[^0-9.]/g, "") })}
+                      value={form.bests?.[bestMachine]?.[f.key] ?? ""}
+                      onChange={(e) => setForm((prev) => ({ ...prev, bests: { ...prev.bests, [bestMachine]: { ...prev.bests[bestMachine], [f.key]: e.target.value.replace(f.int ? /[^0-9]/g : /[^0-9.]/g, "") } } }))}
                       placeholder="—" inputMode="decimal"
                       style={{ width: 64, padding: "10px 10px", borderRadius: 12, border: `1px solid ${C.line}`, background: C.bg, color: C.text, fontSize: 15, height: 42, boxSizing: "border-box" }}
                     />
@@ -2905,7 +2946,7 @@ export default function KaraokeApp() {
                         })}
                       </div>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-                        {TECH_METRICS.map((f) => (
+                        {MACHINE_TECHS[machineOfTake(t)].map((f) => (
                           <span key={f.key} style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
                             <span style={{ fontSize: 11, color: C.muted }}>{f.label}</span>
                             <input
