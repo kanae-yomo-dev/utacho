@@ -473,26 +473,51 @@ async function recRenameSongKey(oldKey, newKey) {
   });
 }
 
-// 保存音声には触れず、再生時だけ左右を平均して両耳へ出す。
-// GainNode自身を1chにする必要がある。音量やStereoPannerの中央指定だけでは片側無音を直せない。
-function createMonoPlayback() {
-  const audio = new Audio();
-  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContextClass) return { audio, url: null, context: null };
-  const context = new AudioContextClass();
-  try {
-    const mono = context.createGain();
-    mono.channelCount = 1;
-    mono.channelCountMode = "explicit";
-    mono.channelInterpretation = "speakers";
-    mono.connect(context.destination);
-    const source = context.createMediaElementSource(audio);
-    source.connect(mono);
-    return { audio, url: null, context, source, mono };
-  } catch (error) {
-    context.close().catch(() => {});
-    throw error;
+// 16bit PCM・1chの再生用WAV。元の録音Blobは変更しない。
+function encodeMonoWav(buffer) {
+  const dataSize = buffer.length * 2;
+  if (dataSize > 0xffffffff - 36) throw new Error("録音が長すぎるため変換できません");
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+  view.setUint32(0, 0x52494646); // RIFF
+  view.setUint32(4, 36 + dataSize, true);
+  view.setUint32(8, 0x57415645); // WAVE
+  view.setUint32(12, 0x666d7420); // fmt
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, buffer.sampleRate, true);
+  view.setUint32(28, buffer.sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  view.setUint32(36, 0x64617461); // data
+  view.setUint32(40, dataSize, true);
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, i) => buffer.getChannelData(i));
+  const parts = [header];
+  // 巨大なPCM配列をもう1本確保せず、分割してBlobに渡す。
+  for (let start = 0; start < buffer.length; start += 16384) {
+    const length = Math.min(16384, buffer.length - start);
+    const chunk = new ArrayBuffer(length * 2);
+    const pcm = new DataView(chunk);
+    for (let i = 0; i < length; i++) {
+      let sample = 0;
+      for (const channel of channels) sample += channel[start + i];
+      sample = Math.max(-1, Math.min(1, sample / channels.length));
+      pcm.setInt16(i * 2, Math.round(sample * (sample < 0 ? 32768 : 32767)), true);
+    }
+    parts.push(chunk);
   }
+  return new Blob(parts, { type: "audio/wav" });
+}
+
+async function prepareMonoPlaybackBlob(blob) {
+  const OfflineContext = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!OfflineContext) return blob;
+  // 音声出力には接続しない。変換を終えてから通常のAudio要素で再生することで、
+  // スリープ中の再生がAudioContextの停止に巻き込まれないようにする。
+  const decoder = new OfflineContext(1, 1, 48000);
+  const decoded = await decoder.decodeAudioData(await blob.arrayBuffer());
+  return decoded.numberOfChannels === 1 ? blob : encodeMonoWav(decoded);
 }
 
 const fmtRecTime = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
@@ -588,6 +613,7 @@ export default function KaraokeApp() {
   const [recState, setRecState] = useState(null); // null | {key, elapsed} 録音中
   const [recError, setRecError] = useState(null);
   const [playingId, setPlayingId] = useState(null); // 再生中テイクid
+  const [preparingTakeId, setPreparingTakeId] = useState(null);
   const [playPaused, setPlayPaused] = useState(false); // 再生の一時停止中
   const [playPos, setPlayPos] = useState(0); // 再生位置(秒)
   const [recSort, setRecSort] = useState("dateDesc"); // 録音一覧のソート
@@ -604,7 +630,9 @@ export default function KaraokeApp() {
   const fileRef = useRef(null);
   const recRef = useRef(null); // {recorder, stream}
   const recTimerRef = useRef(null);
-  const audioRef = useRef(null); // {audio, url, context, source, mono} 再生要素とモノラル接続を使い回す
+  const audioRef = useRef(null); // {audio, url} 通常の音声要素を使い回す
+  const preparedTakeRef = useRef(null); // {id, blob} 再生用コピーは直前の1件だけ保持
+  const playRequestRef = useRef(0); // 停止・曲変更後に古い準備処理が再生を始めるのを防ぐ
   const playingTakeRef = useRef(null); // 再生中テイク(連続再生の次テイク決定用)
   const playingFromListRef = useRef(false); // 録音タブ発の再生か(true=連続/リピート適用。編集シート発は1本で停止)
   const onTakeEndedRef = useRef(null); // 再生終了時の挙動(毎レンダー更新して最新のソート順・モードを参照)
@@ -770,15 +798,14 @@ export default function KaraokeApp() {
   }, []);
 
   useEffect(() => () => {
+    playRequestRef.current++;
+    preparedTakeRef.current = null;
     const cur = audioRef.current;
     if (!cur) return;
     cur.audio.onended = null;
     cur.audio.ontimeupdate = null;
     cur.audio.pause();
     if (cur.url) URL.revokeObjectURL(cur.url);
-    cur.source?.disconnect();
-    cur.mono?.disconnect();
-    cur.context?.close().catch(() => {});
     audioRef.current = null;
   }, []);
 
@@ -1058,6 +1085,8 @@ export default function KaraokeApp() {
   }, [modal, form.title, form.artist, songs]);
 
   const stopPlayback = () => {
+    playRequestRef.current++;
+    setPreparingTakeId(null);
     const cur = audioRef.current;
     if (cur) {
       cur.audio.pause();
@@ -1285,16 +1314,19 @@ export default function KaraokeApp() {
   };
 
   const playTake = async (t, { restart = false, fromList = false } = {}) => {
-    if (!restart && playingId === t.id) {
+    if (!restart && (playingId === t.id || preparingTakeId === t.id)) {
       stopPlayback();
       return;
     }
+    stopPlayback();
+    const request = playRequestRef.current;
+    setPreparingTakeId(t.id);
     try {
       setRecError(null);
       let cur = audioRef.current;
       if (!cur) {
-        cur = createMonoPlayback();
-        const { audio } = cur;
+        const audio = new Audio();
+        cur = { audio, url: null };
         // 秒単位に丸めてstateが変わった時だけ再レンダーさせる
         audio.ontimeupdate = () => setPlayPos(Math.floor(audio.currentTime));
         audio.onended = () => {
@@ -1304,23 +1336,33 @@ export default function KaraokeApp() {
         };
         audioRef.current = cur;
       }
-      // iOSの操作制限に備え、IndexedDBを待つ前(再生ボタンを押した直後)に再開する。
-      const [blob] = await Promise.all([recGetBlob(t.id), cur.context?.resume()]);
+      let blob = preparedTakeRef.current?.id === t.id ? preparedTakeRef.current.blob : null;
       if (!blob) {
-        setRecError("録音データが見つかりませんでした");
-        return;
+        preparedTakeRef.current = null;
+        const original = await recGetBlob(t.id);
+        if (request !== playRequestRef.current) return;
+        if (!original) {
+          setRecError("録音データが見つかりませんでした");
+          return;
+        }
+        blob = await prepareMonoPlaybackBlob(original);
+        if (request !== playRequestRef.current) return;
+        preparedTakeRef.current = { id: t.id, blob };
       }
       if (cur.url) URL.revokeObjectURL(cur.url);
       cur.url = URL.createObjectURL(blob);
       cur.audio.src = cur.url;
       await cur.audio.play();
+      if (request !== playRequestRef.current) return;
       playingTakeRef.current = t;
       playingFromListRef.current = fromList;
       setPlayingId(t.id);
       setPlayPaused(false);
       setPlayPos(0);
     } catch (e) {
-      setRecError("再生に失敗しました");
+      if (request === playRequestRef.current) setRecError("再生に失敗しました。もう一度再生してください。");
+    } finally {
+      if (request === playRequestRef.current) setPreparingTakeId(null);
     }
   };
 
@@ -1339,12 +1381,15 @@ export default function KaraokeApp() {
   const togglePause = async () => {
     const cur = audioRef.current;
     if (!cur || !playingId) return;
+    const request = playRequestRef.current;
     if (cur.audio.paused) {
       try {
-        await Promise.all([cur.context?.resume(), cur.audio.play()]);
+        await cur.audio.play();
+        if (request !== playRequestRef.current) return;
         setPlayPaused(false);
         setRecError(null);
       } catch (error) {
+        if (request !== playRequestRef.current) return;
         cur.audio.pause();
         setPlayPaused(true);
         setRecError("再生に失敗しました。もう一度再生してください。");
@@ -1448,7 +1493,8 @@ export default function KaraokeApp() {
   }, [queue, songs]);
 
   const deleteTake = (t) => {
-    if (playingId === t.id) stopPlayback();
+    if (playingId === t.id || preparingTakeId === t.id) stopPlayback();
+    if (preparedTakeRef.current?.id === t.id) preparedTakeRef.current = null;
     recDeleteIds([t.id]).catch(() => {});
     setRecMeta((m) => m.filter((x) => x.id !== t.id));
     setConfirmTake(null);
@@ -1966,11 +2012,12 @@ export default function KaraokeApp() {
                 ))}
               </div>
               {recError && <p style={{ margin: "0 0 8px", fontSize: 12, color: C.amber }}>{recError}</p>}
+              {preparingTakeId && <p role="status" style={{ color: C.muted, fontSize: 12 }}>音声を準備中… 同じ再生ボタンで中止できます。</p>}
             </div>
 
             <div>
               {sortedAllTakes.map((t) => {
-                const on = playingId === t.id;
+                const on = playingId === t.id || preparingTakeId === t.id;
                 return (
                   <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.line}` }}>
                     <button
@@ -2967,6 +3014,7 @@ export default function KaraokeApp() {
                   {recError && (
                     <p style={{ margin: "8px 0 0", fontSize: 12, color: C.amber }}>{recError}</p>
                   )}
+                  {preparingTakeId && <p role="status" style={{ color: C.muted, fontSize: 12 }}>音声を準備中… 同じ再生ボタンで中止できます。</p>}
                   {editingRecs.map((t) => (
                     <div key={t.id} style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.line}` }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
@@ -2979,7 +3027,7 @@ export default function KaraokeApp() {
                             color: C.cyan, fontSize: 13,
                           }}
                         >
-                          {playingId === t.id ? "■" : "▶"}
+                          {playingId === t.id || preparingTakeId === t.id ? "■" : "▶"}
                         </button>
                         <span style={{ flex: 1, color: C.text }}>{fmtRecDate(t.createdAt)}</span>
                         <span style={{ color: C.muted, flexShrink: 0 }}>{fmtRecTime(t.duration || 0)}</span>
