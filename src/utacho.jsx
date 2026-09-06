@@ -179,7 +179,7 @@ const MACHINE_TECHS = {
     { key: "shakuri", label: "しゃくり", unit: "回", int: true, dashLabel: "しゃくり最多" },
   ],
   JOYSOUND: [
-    { key: "pitchAcc", label: "音程", unit: "%", int: false, dashLabel: "音程正確率" },
+    { key: "pitchAcc", label: "音程", unit: "点", max: 40, int: false, dashLabel: "音程（40点満点）" },
     { key: "vibratoCount", label: "ビブラート", unit: "回", int: true, dashLabel: "ビブラート最多" },
     { key: "shakuri", label: "しゃくり", unit: "回", int: true, dashLabel: "しゃくり最多" },
   ],
@@ -333,7 +333,7 @@ function parseMarkdown(text) {
         prefixed[2].split("・").forEach((itemRaw) => {
           const item = itemRaw.trim();
           if ((km = item.match(/^([0-9.]+)点$/))) song.bests[machine].score = km[1];
-          else if ((km = item.match(/^音程([0-9.]+)%$/))) song.bests[machine].pitchAcc = km[1];
+          else if ((km = item.match(/^音程([0-9.]+)(%|点)$/)) && (km[2] === "%" || machine === "JOYSOUND")) song.bests[machine].pitchAcc = km[1];
           else if ((km = item.match(/^ビブ(?:ラート)?([0-9.]+)(秒|回)$/))) {
             if (machine === "DAM" && km[2] === "秒") song.bests.DAM.vibratoSec = km[1];
             if (machine === "JOYSOUND" && km[2] === "回") song.bests.JOYSOUND.vibratoCount = km[1];
@@ -473,6 +473,28 @@ async function recRenameSongKey(oldKey, newKey) {
   });
 }
 
+// 保存音声には触れず、再生時だけ左右を平均して両耳へ出す。
+// GainNode自身を1chにする必要がある。音量やStereoPannerの中央指定だけでは片側無音を直せない。
+function createMonoPlayback() {
+  const audio = new Audio();
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return { audio, url: null, context: null };
+  const context = new AudioContextClass();
+  try {
+    const mono = context.createGain();
+    mono.channelCount = 1;
+    mono.channelCountMode = "explicit";
+    mono.channelInterpretation = "speakers";
+    mono.connect(context.destination);
+    const source = context.createMediaElementSource(audio);
+    source.connect(mono);
+    return { audio, url: null, context, source, mono };
+  } catch (error) {
+    context.close().catch(() => {});
+    throw error;
+  }
+}
+
 const fmtRecTime = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 const fmtRecDate = (ts) => {
   const d = new Date(ts);
@@ -541,6 +563,7 @@ export default function KaraokeApp() {
   const [sortBy, setSortBy] = useState("added");
   const [modal, setModal] = useState(null); // null | {mode:'add'} | {mode:'edit', id}
   const [form, setForm] = useState(emptyForm);
+  const [savingSong, setSavingSong] = useState(false);
   const [bestMachine, setBestMachine] = useState(() => getLastMachine() || "JOYSOUND");
   const [pick, setPick] = useState(null); // ランダム選曲結果
   const [rolling, setRolling] = useState(false);
@@ -581,7 +604,7 @@ export default function KaraokeApp() {
   const fileRef = useRef(null);
   const recRef = useRef(null); // {recorder, stream}
   const recTimerRef = useRef(null);
-  const audioRef = useRef(null); // {audio, url} Audio要素は使い回す(iOSの自動再生制限対策)
+  const audioRef = useRef(null); // {audio, url, context, source, mono} 再生要素とモノラル接続を使い回す
   const playingTakeRef = useRef(null); // 再生中テイク(連続再生の次テイク決定用)
   const playingFromListRef = useRef(false); // 録音タブ発の再生か(true=連続/リピート適用。編集シート発は1本で停止)
   const onTakeEndedRef = useRef(null); // 再生終了時の挙動(毎レンダー更新して最新のソート順・モードを参照)
@@ -744,6 +767,19 @@ export default function KaraokeApp() {
     if (recSupported) {
       recLoadMeta().then(setRecMeta).catch(() => {});
     }
+  }, []);
+
+  useEffect(() => () => {
+    const cur = audioRef.current;
+    if (!cur) return;
+    cur.audio.onended = null;
+    cur.audio.ontimeupdate = null;
+    cur.audio.pause();
+    if (cur.url) URL.revokeObjectURL(cur.url);
+    cur.source?.disconnect();
+    cur.mono?.disconnect();
+    cur.context?.close().catch(() => {});
+    audioRef.current = null;
   }, []);
 
   const selectTheme = (key) => {
@@ -1087,6 +1123,7 @@ export default function KaraokeApp() {
   }, [anyModalOpen]);
 
   const closeModal = (opts) => {
+    if (savingSong && !opts?.saved) return;
     if (!(opts && opts.skipFlush)) applyEdit(); // 自動保存待ちの変更を確定(削除時はスキップ)
     stopPlayback();
     const r = recRef.current;
@@ -1102,15 +1139,16 @@ export default function KaraokeApp() {
     setModal(null);
   };
 
-  const openAdd = () => {
-    setForm({ ...emptyForm, bests: emptyBests() });
+  const openAdd = (takeId = null) => {
+    setForm({ ...emptyForm, title: takeId ? assignQuery.trim() : "", bests: emptyBests() });
+    setRecError(null);
     setBestMachine(getLastMachine() || "JOYSOUND");
     setConfirmDelete(false);
     resetArtistSearch();
     setNewTag(null);
     setConfirmTagDelete(null);
     setSheetDrag(0);
-    setModal({ mode: "add" });
+    setModal({ mode: "add", takeId });
   };
   const openEdit = (s) => {
     setForm({ ...emptyForm, ...s, bests: s.bests || emptyBests() });
@@ -1126,8 +1164,11 @@ export default function KaraokeApp() {
   };
 
   // 新規追加の確定(編集は自動保存なのでこの関数を通らない)
-  const save = () => {
-    if (!form.title.trim() || modal.mode !== "add") return;
+  const save = async () => {
+    if (!form.title.trim() || modal.mode !== "add" || savingSong) return;
+    const takeId = modal.takeId;
+    setSavingSong(true);
+    setRecError(null);
     const s = {
       ...form,
       title: form.title.trim(),
@@ -1135,8 +1176,17 @@ export default function KaraokeApp() {
       id: `s_${Date.now()}`,
       createdAt: Date.now(),
     };
-    persist([s, ...songs]);
-    closeModal();
+    try {
+      const next = [s, ...songs];
+      await storage.set(STORAGE_KEY, JSON.stringify(next));
+      setSongs(next);
+      closeModal({ saved: true });
+      if (takeId) await assignTakeToSong(takeId, s);
+    } catch (e) {
+      setRecError("曲の保存に失敗しました。もう一度保存してください。");
+    } finally {
+      setSavingSong(false);
+    }
   };
 
   // カスタムタグを全曲から削除する(プリセットタグは削除不可)
@@ -1172,6 +1222,7 @@ export default function KaraokeApp() {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
+          channelCount: { ideal: 1 },
         },
       });
       const mime =
@@ -1239,14 +1290,11 @@ export default function KaraokeApp() {
       return;
     }
     try {
-      const blob = await recGetBlob(t.id);
-      if (!blob) {
-        setRecError("録音データが見つかりませんでした");
-        return;
-      }
+      setRecError(null);
       let cur = audioRef.current;
       if (!cur) {
-        const audio = new Audio();
+        cur = createMonoPlayback();
+        const { audio } = cur;
         // 秒単位に丸めてstateが変わった時だけ再レンダーさせる
         audio.ontimeupdate = () => setPlayPos(Math.floor(audio.currentTime));
         audio.onended = () => {
@@ -1254,8 +1302,13 @@ export default function KaraokeApp() {
           if (h) h();
           else stopPlayback();
         };
-        cur = { audio, url: null };
         audioRef.current = cur;
+      }
+      // iOSの操作制限に備え、IndexedDBを待つ前(再生ボタンを押した直後)に再開する。
+      const [blob] = await Promise.all([recGetBlob(t.id), cur.context?.resume()]);
+      if (!blob) {
+        setRecError("録音データが見つかりませんでした");
+        return;
       }
       if (cur.url) URL.revokeObjectURL(cur.url);
       cur.url = URL.createObjectURL(blob);
@@ -1283,12 +1336,19 @@ export default function KaraokeApp() {
     setPlayPos(Math.floor(sec));
   };
 
-  const togglePause = () => {
+  const togglePause = async () => {
     const cur = audioRef.current;
     if (!cur || !playingId) return;
     if (cur.audio.paused) {
-      cur.audio.play();
-      setPlayPaused(false);
+      try {
+        await Promise.all([cur.context?.resume(), cur.audio.play()]);
+        setPlayPaused(false);
+        setRecError(null);
+      } catch (error) {
+        cur.audio.pause();
+        setPlayPaused(true);
+        setRecError("再生に失敗しました。もう一度再生してください。");
+      }
     } else {
       cur.audio.pause();
       setPlayPaused(true);
@@ -1395,15 +1455,22 @@ export default function KaraokeApp() {
   };
 
   // クイック録音したテイクを曲に紐付ける(「曲を選ぶ」で後からでも可)
-  const assignTakeToSong = (takeId, s) => {
+  const assignTakeToSong = async (takeId, s) => {
     const t = recMeta.find((x) => x.id === takeId);
-    if (t) {
-      const next = { ...t, songKey: songKey(s) };
-      setRecMeta((m) => m.map((x) => (x.id === takeId ? next : x)));
-      recPutMeta(next).catch(() => {});
+    if (!t) {
+      setRecError("録音が見つかりませんでした。");
+      return;
     }
-    setAssignTake(null);
-    setAssignQuery("");
+    try {
+      const next = { ...t, songKey: songKey(s) };
+      await recPutMeta(next);
+      setRecMeta((m) => m.map((x) => (x.id === takeId ? next : x)));
+      setAssignTake(null);
+      setAssignQuery("");
+      setRecError(null);
+    } catch (e) {
+      setRecError("録音に曲を設定できませんでした。もう一度曲を選んでください。");
+    }
   };
 
   // テイクの点数・採点機を更新。値が同じ採点機枠の自己ベストを超えたら自動で更新する
@@ -1753,7 +1820,7 @@ export default function KaraokeApp() {
           🎲 次の一曲を選ぶ
         </button>
         <button
-          onClick={openAdd}
+          onClick={() => openAdd()}
           style={{
             flex: 1, padding: "14px 0", borderRadius: 14, border: "none",
             background: C.magenta, color: C.onAccent, fontSize: 15, fontWeight: 800, cursor: "pointer",
@@ -2146,7 +2213,7 @@ export default function KaraokeApp() {
       )}
 
       {/* 🔗 録音テイクの曲選択モーダル */}
-      {assignTake !== null && (
+      {assignTake !== null && modal === null && (
         <div
           onClick={() => {
             setAssignTake(null);
@@ -2168,6 +2235,7 @@ export default function KaraokeApp() {
           >
             <div style={{ padding: "16px 20px 0", flexShrink: 0 }}>
               <h2 style={{ margin: "0 0 10px", fontSize: 17 }}>🎙 この録音の曲を選ぶ</h2>
+              {recError && <p role="alert" style={{ color: C.danger, fontSize: 13 }}>{recError}</p>}
               <input
                 value={assignQuery}
                 onChange={(e) => setAssignQuery(e.target.value)}
@@ -2212,6 +2280,12 @@ export default function KaraokeApp() {
               })()}
             </div>
             <div style={{ padding: "10px 20px 14px", flexShrink: 0, borderTop: `1px solid ${C.line}` }}>
+              <button
+                onClick={() => openAdd(assignTake)}
+                style={{ width: "100%", padding: "12px 0", marginBottom: 8, borderRadius: 12, border: "none", background: C.magenta, color: C.onAccent, cursor: "pointer", fontSize: 14, fontWeight: 700 }}
+              >
+                ＋ 新しい曲を登録
+              </button>
               <button
                 onClick={() => {
                   setAssignTake(null);
@@ -2757,11 +2831,15 @@ export default function KaraokeApp() {
                     <span style={{ fontSize: 12, color: C.muted }}>{f.label}</span>
                     <input
                       value={form.bests?.[bestMachine]?.[f.key] ?? ""}
-                      onChange={(e) => setForm((prev) => ({ ...prev, bests: { ...prev.bests, [bestMachine]: { ...prev.bests[bestMachine], [f.key]: e.target.value.replace(f.int ? /[^0-9]/g : /[^0-9.]/g, "") } } }))}
+                      onChange={(e) => {
+                        const value = e.target.value.replace(f.int ? /[^0-9]/g : /[^0-9.]/g, "");
+                        setForm((prev) => ({ ...prev, bests: { ...prev.bests, [bestMachine]: { ...prev.bests[bestMachine], [f.key]: f.max && Number(value) > f.max ? String(f.max) : value } } }));
+                      }}
+                      aria-label={`${bestMachine} ${f.label}${f.max ? `（${f.max}点満点）` : ""}`}
                       placeholder="—" inputMode="decimal"
                       style={{ width: 64, padding: "10px 10px", borderRadius: 12, border: `1px solid ${C.line}`, background: C.bg, color: C.text, fontSize: 15, height: 42, boxSizing: "border-box" }}
                     />
-                    <span style={{ fontSize: 12, color: C.muted }}>{f.unit}</span>
+                    <span style={{ fontSize: 12, color: C.muted }}>{f.unit}{f.max ? ` / ${f.max}点` : ""}</span>
                   </span>
                 ))}
               </div>
@@ -2951,11 +3029,15 @@ export default function KaraokeApp() {
                             <span style={{ fontSize: 11, color: C.muted }}>{f.label}</span>
                             <input
                               value={t[f.key] || ""}
-                              onChange={(e) => updateTake(t, { [f.key]: e.target.value.replace(f.int ? /[^0-9]/g : /[^0-9.]/g, "") })}
+                              onChange={(e) => {
+                                const value = e.target.value.replace(f.int ? /[^0-9]/g : /[^0-9.]/g, "");
+                                updateTake(t, { [f.key]: f.max && Number(value) > f.max ? String(f.max) : value });
+                              }}
+                              aria-label={`録音 ${machineOfTake(t)} ${f.label}${f.max ? `（${f.max}点満点）` : ""}`}
                               placeholder="—" inputMode="decimal"
                               style={{ width: 52, padding: "8px 8px", borderRadius: 10, border: `1px solid ${C.line}`, background: C.panel, color: C.text, fontSize: 14 }}
                             />
-                            <span style={{ fontSize: 11, color: C.muted }}>{f.unit}</span>
+                            <span style={{ fontSize: 11, color: C.muted }}>{f.unit}{f.max ? ` / ${f.max}点` : ""}</span>
                           </span>
                         ))}
                       </div>
@@ -2968,8 +3050,11 @@ export default function KaraokeApp() {
               </>
             )}
             {recSupported && modal.mode === "add" && (
-              <p style={{ margin: "0 0 14px", fontSize: 12, color: C.muted }}>🎙 録音は保存後の編集画面からできます。</p>
+              <p style={{ margin: "0 0 14px", fontSize: 12, color: C.muted }}>
+                {modal.takeId ? "🎙 登録すると、この録音に曲を設定します。" : "🎙 録音は保存後の編集画面からできます。"}
+              </p>
             )}
+            {modal.mode === "add" && recError && <p role="alert" style={{ color: C.danger, fontSize: 13 }}>{recError}</p>}
 
             {dupSong && (
               <p style={{ margin: "0 0 10px", fontSize: 12, color: C.amber }}>
@@ -3014,7 +3099,7 @@ export default function KaraokeApp() {
                   </button>
                   <button
                     onClick={save}
-                    disabled={!form.title.trim()}
+                    disabled={!form.title.trim() || savingSong}
                     style={{
                       flex: 1, padding: "13px 0", borderRadius: 12, border: "none",
                       background: form.title.trim() ? C.magenta : C.panelHi,
@@ -3022,7 +3107,7 @@ export default function KaraokeApp() {
                       cursor: form.title.trim() ? "pointer" : "not-allowed",
                     }}
                   >
-                    保存
+                    {savingSong ? "保存中…" : modal.takeId ? "登録して録音に設定" : "保存"}
                   </button>
                 </>
               )}
