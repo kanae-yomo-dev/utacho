@@ -520,6 +520,14 @@ async function prepareMonoPlaybackBlob(blob) {
   return decoded.numberOfChannels === 1 ? blob : encodeMonoWav(decoded);
 }
 
+function nextTakeForPlayback(take, takes, continuous, repeat) {
+  if (!take) return null;
+  const index = takes.findIndex((t) => t.id === take.id);
+  if (index < 0) return null;
+  if (!continuous) return repeat ? takes[index] : null;
+  return takes[index + 1] || (repeat ? takes[0] : null);
+}
+
 const fmtRecTime = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 const fmtRecDate = (ts) => {
   const d = new Date(ts);
@@ -631,7 +639,8 @@ export default function KaraokeApp() {
   const recRef = useRef(null); // {recorder, stream}
   const recTimerRef = useRef(null);
   const audioRef = useRef(null); // {audio, url} 通常の音声要素を使い回す
-  const preparedTakeRef = useRef(null); // {id, blob} 再生用コピーは直前の1件だけ保持
+  const preparedTakeRef = useRef(null); // {id, blob} 現在の曲の再生用コピー
+  const nextPreparedTakeRef = useRef(null); // {id, blob} 再生中に準備する次の1件
   const playRequestRef = useRef(0); // 停止・曲変更後に古い準備処理が再生を始めるのを防ぐ
   const playingTakeRef = useRef(null); // 再生中テイク(連続再生の次テイク決定用)
   const playingFromListRef = useRef(false); // 録音タブ発の再生か(true=連続/リピート適用。編集シート発は1本で停止)
@@ -800,6 +809,7 @@ export default function KaraokeApp() {
   useEffect(() => () => {
     playRequestRef.current++;
     preparedTakeRef.current = null;
+    nextPreparedTakeRef.current = null;
     const cur = audioRef.current;
     if (!cur) return;
     cur.audio.onended = null;
@@ -1089,7 +1099,7 @@ export default function KaraokeApp() {
     setPreparingTakeId(null);
     const cur = audioRef.current;
     if (cur) {
-      cur.audio.pause();
+      if (!cur.audio.paused) cur.audio.pause();
       if (cur.url) URL.revokeObjectURL(cur.url);
       cur.url = null;
       // Audio要素自体は破棄しない: ユーザー操作で有効化済みの要素を使い回すことで
@@ -1337,6 +1347,11 @@ export default function KaraokeApp() {
         audioRef.current = cur;
       }
       let blob = preparedTakeRef.current?.id === t.id ? preparedTakeRef.current.blob : null;
+      if (!blob && nextPreparedTakeRef.current?.id === t.id) {
+        blob = nextPreparedTakeRef.current.blob;
+        preparedTakeRef.current = nextPreparedTakeRef.current;
+        nextPreparedTakeRef.current = null;
+      }
       if (!blob) {
         preparedTakeRef.current = null;
         const original = await recGetBlob(t.id);
@@ -1424,6 +1439,35 @@ export default function KaraokeApp() {
     return arr.sort(cmp || ((a, b) => b.createdAt - a.createdAt));
   }, [recMeta, songs, recSort]);
 
+  // 次の録音を再生中に準備する。終了イベント内ではIndexedDBや変換を待たずにplay()する。
+  useEffect(() => {
+    const current = sortedAllTakes.find((t) => t.id === playingId);
+    const next = playingFromListRef.current
+      ? nextTakeForPlayback(current, sortedAllTakes, recContinuous, recRepeat)
+      : null;
+    if (!next || next.id === playingId) {
+      nextPreparedTakeRef.current = null;
+      return;
+    }
+    if (nextPreparedTakeRef.current?.id === next.id) return;
+    nextPreparedTakeRef.current = null;
+    const request = playRequestRef.current;
+    let cancelled = false;
+    (async () => {
+      try {
+        const original = await recGetBlob(next.id);
+        if (!original || cancelled || request !== playRequestRef.current) return;
+        const blob = await prepareMonoPlaybackBlob(original);
+        if (!cancelled && request === playRequestRef.current) {
+          nextPreparedTakeRef.current = { id: next.id, blob };
+        }
+      } catch (error) {
+        // 先読みだけの失敗で現在の再生は止めない。曲が切り替わる際に通常の読込で再試行する。
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [playingId, sortedAllTakes, recContinuous, recRepeat]);
+
   // 再生終了時の挙動。毎レンダー上書きすることで最新のソート順・連続/リピート設定を参照する
   useEffect(() => {
     onTakeEndedRef.current = () => {
@@ -1432,22 +1476,10 @@ export default function KaraokeApp() {
         stopPlayback(); // 編集シート発の再生は従来どおり1本で停止
         return;
       }
-      if (recRepeat && !recContinuous) {
-        playTake(t, { restart: true, fromList: true }); // 1本リピート
+      const next = nextTakeForPlayback(t, sortedAllTakes, recContinuous, recRepeat);
+      if (next) {
+        playTake(next, { restart: true, fromList: true });
         return;
-      }
-      if (recContinuous) {
-        const i = sortedAllTakes.findIndex((x) => x.id === t.id);
-        const next =
-          i >= 0 && i + 1 < sortedAllTakes.length
-            ? sortedAllTakes[i + 1]
-            : recRepeat && sortedAllTakes.length > 0
-              ? sortedAllTakes[0] // 全体ループ
-              : null;
-        if (next) {
-          playTake(next, { restart: true, fromList: true });
-          return;
-        }
       }
       stopPlayback();
     };
@@ -1495,6 +1527,7 @@ export default function KaraokeApp() {
   const deleteTake = (t) => {
     if (playingId === t.id || preparingTakeId === t.id) stopPlayback();
     if (preparedTakeRef.current?.id === t.id) preparedTakeRef.current = null;
+    if (nextPreparedTakeRef.current?.id === t.id) nextPreparedTakeRef.current = null;
     recDeleteIds([t.id]).catch(() => {});
     setRecMeta((m) => m.filter((x) => x.id !== t.id));
     setConfirmTake(null);
