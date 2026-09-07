@@ -154,7 +154,7 @@ const getSavedTheme = () => {
 
 const TAGS = ["練習中", "張り上げ", "歌い上げ"];
 const STORAGE_KEY = "karaoke-repertoire";
-const APP_VERSION = "2026-07-13u"; // 設定モーダルに表示。どのビルドが動いているかの確認用にデプロイごとに更新する
+const APP_VERSION = "2026-09-08a"; // 設定モーダルに表示。どのビルドが動いているかの確認用にデプロイごとに更新する
 
 // Claude Artifacts では window.storage、通常のブラウザ(PWA)では localStorage を使う
 const storage =
