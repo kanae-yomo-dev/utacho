@@ -154,7 +154,7 @@ const getSavedTheme = () => {
 
 const TAGS = ["練習中", "張り上げ", "歌い上げ"];
 const STORAGE_KEY = "karaoke-repertoire";
-const APP_VERSION = "2026-09-08a"; // 設定モーダルに表示。どのビルドが動いているかの確認用にデプロイごとに更新する
+const APP_VERSION = "2026-11-01a"; // 設定モーダルに表示。どのビルドが動いているかの確認用にデプロイごとに更新する
 
 // Claude Artifacts では window.storage、通常のブラウザ(PWA)では localStorage を使う
 const storage =
@@ -1533,6 +1533,43 @@ export default function KaraokeApp() {
     setConfirmTake(null);
   };
 
+  // 録音1本を端末のファイルとして書き出す(iOSは共有シート→「ファイルに保存」。非対応環境はダウンロード)
+  const exportTake = async (t) => {
+    try {
+      const blob = await recGetBlob(t.id);
+      if (!blob) {
+        setRecError("録音の音声が見つかりませんでした。");
+        return;
+      }
+      const mime = t.mimeType || blob.type || "";
+      const ext = /mp4|aac|m4a/.test(mime) ? "m4a" : /ogg/.test(mime) ? "ogg" : "webm";
+      const safe = (x) => String(x || "").replace(/[\\/:*?"<>|]/g, "_").trim();
+      const d = new Date(t.createdAt || Date.now());
+      const pad = (n) => String(n).padStart(2, "0");
+      const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+      const name = `${safe(t.title) || "録音"}_${stamp}.${ext}`;
+      const file = new File([blob], name, { type: mime || "application/octet-stream" });
+      if (typeof navigator !== "undefined" && typeof navigator.canShare === "function" && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file] });
+          return;
+        } catch (e) {
+          if (e && e.name === "AbortError") return;
+        }
+      }
+      const url = URL.createObjectURL(file);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      setRecError("録音の書き出しに失敗しました。");
+    }
+  };
+
   // クイック録音したテイクを曲に紐付ける(「曲を選ぶ」で後からでも可)
   const assignTakeToSong = async (takeId, s) => {
     const t = recMeta.find((x) => x.id === takeId);
@@ -2094,6 +2131,16 @@ export default function KaraokeApp() {
                         曲を選ぶ
                       </button>
                     )}
+                    <button
+                      onClick={() => exportTake(t)}
+                      aria-label="録音を保存"
+                      style={{
+                        padding: "7px 10px", borderRadius: 10, cursor: "pointer", flexShrink: 0, fontSize: 12,
+                        border: `1px solid ${C.cyan}`, background: "transparent", color: C.cyan, whiteSpace: "nowrap",
+                      }}
+                    >
+                      保存
+                    </button>
                     <button
                       onClick={() => (confirmTake === t.id ? deleteTake(t) : setConfirmTake(t.id))}
                       style={{
@@ -3065,6 +3112,16 @@ export default function KaraokeApp() {
                         <span style={{ flex: 1, color: C.text }}>{fmtRecDate(t.createdAt)}</span>
                         <span style={{ color: C.muted, flexShrink: 0 }}>{fmtRecTime(t.duration || 0)}</span>
                         <span style={{ color: C.muted, flexShrink: 0 }}>{fmtRecSize(t.size || 0)}</span>
+                        <button
+                          onClick={() => exportTake(t)}
+                          aria-label="録音を保存"
+                          style={{
+                            padding: "6px 10px", borderRadius: 10, cursor: "pointer", flexShrink: 0, fontSize: 12,
+                            border: `1px solid ${C.cyan}`, background: "transparent", color: C.cyan,
+                          }}
+                        >
+                          保存
+                        </button>
                         <button
                           onClick={() => (confirmTake === t.id ? deleteTake(t) : setConfirmTake(t.id))}
                           style={{
