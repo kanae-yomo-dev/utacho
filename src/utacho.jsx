@@ -154,7 +154,7 @@ const getSavedTheme = () => {
 
 const TAGS = ["練習中", "張り上げ", "歌い上げ"];
 const STORAGE_KEY = "karaoke-repertoire";
-const APP_VERSION = "2026-11-01b"; // 設定モーダルに表示。どのビルドが動いているかの確認用にデプロイごとに更新する
+const APP_VERSION = "2026-11-01c"; // 設定モーダルに表示。どのビルドが動いているかの確認用にデプロイごとに更新する
 
 // Claude Artifacts では window.storage、通常のブラウザ(PWA)では localStorage を使う
 const storage =
@@ -1576,13 +1576,16 @@ export default function KaraokeApp() {
   // 録音1本を端末のファイルとして書き出す(iOSは共有シート→「ファイルに保存」。非対応環境はダウンロード)
   const exportTake = async (t) => {
     try {
-      const blob = await recGetBlob(t.id);
-      if (!blob) {
+      const raw = await recGetBlob(t.id);
+      if (!raw) {
         setRecError("録音の音声が見つかりませんでした。");
         return;
       }
-      const mime = t.mimeType || blob.type || "";
-      const ext = /mp4|aac|m4a/.test(mime) ? "m4a" : /ogg/.test(mime) ? "ogg" : "webm";
+      // 片側だけに音が入ったステレオ録音は、再生と同じ変換で1chのWAVにしてから書き出す(元の録音は変更しない)
+      let blob = raw;
+      try { blob = await prepareMonoPlaybackBlob(raw); } catch (e) { blob = raw; }
+      const mime = blob === raw ? (t.mimeType || raw.type || "") : "audio/wav";
+      const ext = blob !== raw ? "wav" : /mp4|aac|m4a/.test(mime) ? "m4a" : /ogg/.test(mime) ? "ogg" : "webm";
       const safe = (x) => String(x || "").replace(/[\\/:*?"<>|]/g, "_").trim();
       const d = new Date(t.createdAt || Date.now());
       const pad = (n) => String(n).padStart(2, "0");
