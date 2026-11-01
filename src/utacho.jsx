@@ -154,7 +154,7 @@ const getSavedTheme = () => {
 
 const TAGS = ["練習中", "張り上げ", "歌い上げ"];
 const STORAGE_KEY = "karaoke-repertoire";
-const APP_VERSION = "2026-11-01a"; // 設定モーダルに表示。どのビルドが動いているかの確認用にデプロイごとに更新する
+const APP_VERSION = "2026-11-01b"; // 設定モーダルに表示。どのビルドが動いているかの確認用にデプロイごとに更新する
 
 // Claude Artifacts では window.storage、通常のブラウザ(PWA)では localStorage を使う
 const storage =
@@ -1249,6 +1249,36 @@ export default function KaraokeApp() {
 
   // ---- 録音 ----
   // key="" はクイック録音(曲未設定)。停止後に曲選択モーダルで紐付ける
+  // 録音中は画面を点けたままにする(Screen Wake Lock)。iOSのホーム画面アプリではスリープでマイク取得が止まるため。
+  // 省電力モード等で取れないときは黙って諦める(録音自体は続ける)
+  const wakeLockRef = useRef(null);
+  const acquireWakeLock = async () => {
+    if (typeof navigator === "undefined" || !navigator.wakeLock) return;
+    try {
+      const lock = await navigator.wakeLock.request("screen");
+      wakeLockRef.current = lock;
+      lock.addEventListener("release", () => {
+        if (wakeLockRef.current === lock) wakeLockRef.current = null;
+      });
+    } catch (e) {
+      wakeLockRef.current = null;
+    }
+  };
+  const releaseWakeLock = () => {
+    const lock = wakeLockRef.current;
+    wakeLockRef.current = null;
+    if (lock) lock.release().catch(() => {});
+  };
+  // 画面が戻ったとき、録音中ならロックを取り直す(非表示になると自動で解放されるため)
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVis = () => {
+      if (document.visibilityState === "visible" && recRef.current && !wakeLockRef.current) acquireWakeLock();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
   const startRecording = async (key) => {
     if (recState) return; // 二重録音防止
     setRecError(null);
@@ -1278,6 +1308,7 @@ export default function KaraokeApp() {
       };
       recorder.onstop = async () => {
         stream.getTracks().forEach((tr) => tr.stop()); // マイク解放
+        releaseWakeLock();
         clearInterval(recTimerRef.current);
         setRecState(null);
         recRef.current = null;
@@ -1305,8 +1336,17 @@ export default function KaraokeApp() {
           setRecError("録音の保存に失敗しました");
         }
       };
+      // スリープや電話などで途中で止まっても、それまでの分を保存する
+      const onInterrupted = () => {
+        if (recorder.state === "inactive") return;
+        setRecError("録音が途中で止まりました(スリープや割り込み)。ここまでの分を保存しました。");
+        try { recorder.stop(); } catch (e) { /* 既に停止 */ }
+      };
+      recorder.onerror = onInterrupted;
+      stream.getTracks().forEach((tr) => { tr.onended = onInterrupted; });
       recRef.current = { recorder, stream };
-      recorder.start();
+      recorder.start(1000); // 1秒ごとに区切って受け取る(中断時にそれまでの分が残るように)
+      acquireWakeLock();
       // 容量逼迫時にブラウザが録音データを消さないよう永続化を要求(拒否されても動作は変わらない)
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
       setRecState({ key, elapsed: 0 });
